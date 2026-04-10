@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <vector>
+#include <limits>
 
 #include "../util.h"
 #include "base.h"
@@ -96,7 +97,7 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
   std::string name() const { return "HybridPGMLIPP"; }
 
-  std::size_t size() const { return pgm_.size_in_bytes() + lipp_.size(); }
+  std::size_t size() const { return pgm_.size_in_bytes() + lipp_.index_size(); }
 
   bool applicable(bool unique, bool range_query, bool insert, bool multithread, const std::string& ops_filename) const {
     std::string name = SearchClass::name();
@@ -123,14 +124,14 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
   bool FlushInsertToLIPP(const KeyValue<KeyType>& data, uint32_t thread_id) {
 
-    auto pgm_it = pgm_.begin();
+    auto pgm_it = pgm_.lower_bound(std::numeric_limits<KeyType>::min());
     auto pgm_end = pgm_.end();
 
     while (pgm_it != pgm_end)
     {
       auto key = pgm_it -> key();
       auto value = pgm_it->value();
-      auto res = lipp_.insert(key, value);
+      lipp_.insert(key, value);
 
       ++pgm_it;
     }

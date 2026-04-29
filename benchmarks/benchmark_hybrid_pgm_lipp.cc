@@ -14,7 +14,14 @@ template <typename Searcher>
 void benchmark_64_hybrid_pgm_lipp(tli::Benchmark<uint64_t>& benchmark,
                                  bool pareto,
                                  const std::vector<int>& params) {
-  // Intentionally empty
+
+  benchmark.template Run<
+      HybridPGMLIPP<uint64_t, Searcher, 128>
+  >();
+
+  // benchmark.template Run<
+  //     HybridPGMLIPP<uint64_t, Searcher, 64>
+  // >();
 }
 
 // Main benchmark (reduced)

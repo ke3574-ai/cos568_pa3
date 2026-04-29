@@ -43,7 +43,14 @@ template <typename Searcher>
 void benchmark_64_dynamic_pgm(tli::Benchmark<uint64_t>& benchmark,
                              bool pareto,
                              const std::vector<int>& params) {
-  // Do nothing — prevent instantiation of many configs
+
+  benchmark.template Run<
+      DynamicPGM<uint64_t, Searcher, 64>
+  >();
+
+  // benchmark.template Run<
+  //     DynamicPGM<uint64_t, Searcher, 128>
+  // >();
 }
 
 // Keep template instantiation macro

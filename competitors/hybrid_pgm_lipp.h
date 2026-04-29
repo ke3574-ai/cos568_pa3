@@ -132,7 +132,7 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
   // Control Logic
   //@todo, in the future, can pass this value from params[0] in the cosnt
-  size_t flush_threshold_ = 100000;
+  size_t flush_threshold_ = 500000;
   size_t current_buffer_size_ = 0;
 
   bool is_built_ = false;

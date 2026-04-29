@@ -38,4 +38,3 @@ fi
 # else
 #     echo "osm_cellids dataset already exists, skipping download."
 # fi
-

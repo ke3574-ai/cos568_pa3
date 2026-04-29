@@ -28,9 +28,9 @@ void benchmark_64_hybrid_pgm_lipp(tli::Benchmark<uint64_t>& benchmark,
   }
 
   // Only run mixed workloads (0.9 and 0.1 insert)
-  if (filename.find("mix") == std::string::npos) {
-    return;
-  }
+  // if (filename.find("mix") == std::string::npos) {
+  //   return;
+  // }
 
   // -------------------------------------------------
   // Best-performing configs from your experiments
@@ -41,10 +41,10 @@ void benchmark_64_hybrid_pgm_lipp(tli::Benchmark<uint64_t>& benchmark,
       HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 128>
   >();
 
-  // Secondary (sanity comparison)
-  benchmark.template Run<
-      HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64>
-  >();
+  // // Secondary (sanity comparison)
+  // benchmark.template Run<
+  //     HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64>
+  // >();
 }
 
 // Keep template instantiation macro

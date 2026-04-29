@@ -19,9 +19,9 @@ void benchmark_64_dynamic_pgm(tli::Benchmark<uint64_t>& benchmark,
   }
 
   // Only run for mixed workloads (0.9 and 0.1 insert)
-  if (filename.find("mix") == std::string::npos) {
-    return;
-  }
+  // if (filename.find("mix") == std::string::npos) {
+  //   return;
+  // }
 
   // -------------------------------------------------
   // ONLY instantiate best-performing configs
@@ -33,9 +33,9 @@ void benchmark_64_dynamic_pgm(tli::Benchmark<uint64_t>& benchmark,
   >();
 
   // Optional secondary (for sanity comparison)
-  benchmark.template Run<
-      DynamicPGM<uint64_t, BranchingBinarySearch<record>, 128>
-  >();
+  // benchmark.template Run<
+  //     DynamicPGM<uint64_t, BranchingBinarySearch<record>, 128>
+  // >();
 }
 
 // Disable pareto version entirely (avoids template explosion)

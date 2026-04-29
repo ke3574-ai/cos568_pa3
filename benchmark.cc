@@ -46,14 +46,8 @@ using namespace std;
     break;                                                    \
   }
 
-
 #define add_search_types(func, type, record) \
-  add_default(func, type, record) \
-  add_search_type("binary", func, type, BranchingBinarySearch<record>, record);                           \
-  add_search_type("linear", func, type, LinearSearch<record>, record);                                    \
-  add_search_type("avx", func, type, LinearAVX<type COMMA record>, record);                               \
-  add_search_type("interpolation", func, type, InterpolationSearch<record>, record);                      \
-  add_search_type("exponential", func, type, ExponentialSearch<record>, record);
+  add_search_type("binary", func, type, BranchingBinarySearch<record>, record);
 
 // 1) Overload that passes a specific search class
 template <class SearchClass, int record>
@@ -61,12 +55,14 @@ void execute_64_bit(tli::Benchmark<uint64_t>& benchmark, bool pareto,
                     const std::vector<int>& params, bool only_mode,
                     const std::string& only, const std::string& /*filename*/) 
 {
-  // Only run if user specifies --only=PGM or --only=BTree.
-  check_only("PGM", benchmark_64_pgm<SearchClass>(benchmark, pareto, params));
-  check_only("BTree", benchmark_64_btree<SearchClass>(benchmark, pareto, params));
-  check_only("DynamicPGM", benchmark_64_dynamic_pgm<SearchClass>(benchmark, pareto, params));
-  check_only("LIPP", benchmark_64_lipp(benchmark));
-  check_only("HybridPGMLIPP", benchmark_64_hybrid_pgm_lipp<SearchClass>(benchmark, pareto, params));
+  check_only("DynamicPGM",
+      benchmark_64_dynamic_pgm<SearchClass>(benchmark, pareto, params));
+
+  check_only("LIPP",
+      benchmark_64_lipp(benchmark));
+
+  check_only("HybridPGMLIPP",
+      benchmark_64_hybrid_pgm_lipp<SearchClass>(benchmark, pareto, params));
 }
 
 // 2) Overload that doesn't pass a search class
@@ -74,12 +70,14 @@ template <int record>
 void execute_64_bit(tli::Benchmark<uint64_t>& benchmark, bool only_mode,
                     const std::string& only, const std::string& filename)
 {
-  // Only run if user specifies --only=PGM or --only=BTree
-  check_only("PGM", benchmark_64_pgm<record>(benchmark, filename));
-  check_only("BTree", benchmark_64_btree<record>(benchmark, filename));
-  check_only("DynamicPGM", benchmark_64_dynamic_pgm<record>(benchmark, filename));
-  check_only("LIPP", benchmark_64_lipp(benchmark));
-  check_only("HybridPGMLIPP", benchmark_64_hybrid_pgm_lipp<record>(benchmark, filename));
+  check_only("DynamicPGM",
+      benchmark_64_dynamic_pgm<record>(benchmark, filename));
+
+  check_only("LIPP",
+      benchmark_64_lipp(benchmark));
+
+  check_only("HybridPGMLIPP",
+      benchmark_64_hybrid_pgm_lipp<record>(benchmark, filename));
 }
 
 // We don't do string benchmarks in this minimal build
@@ -108,12 +106,10 @@ int main(int argc, char* argv[]) {
     ("errors", "Tracks index errors, and report those instead of lookup times")
     ("verify", "Verify correctness of execution")
     ("csv", "Output a CSV of results in addition to a text file")
-    ("search", "Specify a search type (binary, linear, etc.)", 
-       cxxopts::value<std::string>()->default_value("binary"))
+    ("search", "Specify a search type", cxxopts::value<std::string>()->default_value("binary"))
     ("params", "Set parameters of index", cxxopts::value<std::vector<int>>()->default_value(""));
 
   options.parse_positional({"data", "ops"});
-
   auto result = options.parse(argc, argv);
 
   if (result.count("help")) {
@@ -136,9 +132,8 @@ int main(int argc, char* argv[]) {
   bool csv          = result.count("csv");
   bool pareto       = result.count("pareto");
 
-  std::string filename   = result["data"].as<std::string>();
-  std::string ops        = result["ops"].as<std::string>();
-  std::string search_type= result["search"].as<std::string>();
+  std::string filename = result["data"].as<std::string>();
+  std::string ops      = result["ops"].as<std::string>();
 
   bool only_mode = result.count("only") || std::getenv("TLI_ONLY");
   std::vector<int> params = result["params"].as<std::vector<int>>();
@@ -156,32 +151,28 @@ int main(int argc, char* argv[]) {
 
   switch (type) {
     case DataType::UINT64: {
-      // Create benchmark.
-      if (track_errors){
-        if (num_threads > 1){
-          add_search_types(execute_64_bit, uint64_t, 2);
+      tli::Benchmark<uint64_t> benchmark(
+          filename, ops, num_repeats, through, build, fence,
+          cold_cache, track_errors, csv, num_threads, verify);
+
+      if (track_errors) {
+        if (num_threads > 1) {
+          execute_64_bit<BranchingBinarySearch<2>, 2>(
+              benchmark, pareto, params, only_mode, only, filename);
         } else {
-          add_search_types(execute_64_bit, uint64_t, 1);
+          execute_64_bit<BranchingBinarySearch<1>, 1>(
+              benchmark, pareto, params, only_mode, only, filename);
         }
-      }
-      else{
-        add_search_types(execute_64_bit, uint64_t, 0);
+      } else {
+        execute_64_bit<BranchingBinarySearch<0>, 0>(
+            benchmark, pareto, params, only_mode, only, filename);
       }
       break;
     }
 
     case DataType::STRING: {
-      // Create benchmark.
-      if (track_errors){
-        if (num_threads > 1){
-          add_search_types(execute_string, std::string, 2);
-        } else{
-          add_search_types(execute_string, std::string, 1);
-        }
-      }
-      else{
-        add_search_types(execute_string, std::string, 0);
-      }
+      // Disabled / minimal
+      std::cout << "String benchmarks disabled in minimal build.\n";
       break;
     }
   }

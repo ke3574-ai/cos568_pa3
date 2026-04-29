@@ -49,53 +49,120 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
     return build_time;
   }
 
+  // size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+
+  //   uint64_t value;
+  //   bool found = false;
+  //   if (lipp_.find(lookup_key, value)){
+  //       found = true;
+  //   }
+  //   //@todo check if inserts are unique or not. Otherwise, have to check both ogm ad lipp and return newer data
+  //   if (!found)
+  //   {
+  //     auto it = pgm_.find(lookup_key);
+  //     if (it == pgm_.end()) {
+  //       value = util::OVERFLOW;
+  //     } else {
+  //       value = it->value();
+  //     }
+  //   }
+
+  //   lookup_count_++;
+
+  //   return value;
+  // }
+
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
 
-    uint64_t value;
-    bool found = false;
-    if (lipp_.find(lookup_key, value)){
-        found = true;
-    }
-    //@todo check if inserts are unique or not. Otherwise, have to check both ogm ad lipp and return newer data
-    if (!found)
-    {
-      auto it = pgm_.find(lookup_key);
-      if (it == pgm_.end()) {
-        value = util::OVERFLOW;
-      } else {
-        value = it->value();
-      }
-    }
+      uint64_t value;
 
-    return value;
+      // 1. Check active buffer (newest)
+      auto it = pgm_active_.find(lookup_key);
+      if (it != pgm_active_.end()) {
+          lookup_count_++;
+          return it->value();
+      }
+
+      // 2. Check flush buffer (recent, in-flight)
+      it = pgm_flush_.find(lookup_key);
+      if (it != pgm_flush_.end()) {
+          lookup_count_++;
+          return it->value();
+      }
+
+      // 3. Check LIPP (base)
+      if (lipp_.find(lookup_key, value)) {
+          lookup_count_++;
+          return value;
+      }
+
+      lookup_count_++;
+      return util::OVERFLOW;
   }
 
-  uint64_t RangeQuery(const KeyType& lower_key, const KeyType& upper_key, uint32_t thread_id) const {
+  // uint64_t RangeQuery(const KeyType& lower_key, const KeyType& upper_key, uint32_t thread_id) const {
 
-    auto pgm_it = pgm_.lower_bound(lower_key);
-    uint64_t result = 0;
-    while(pgm_it != pgm_.end() && pgm_it->key() <= upper_key){
-      result += pgm_it->value();
-      ++pgm_it;
-    }
+  //   auto pgm_it = pgm_.lower_bound(lower_key);
+  //   uint64_t result = 0;
+  //   while(pgm_it != pgm_.end() && pgm_it->key() <= upper_key){
+  //     result += pgm_it->value();
+  //     ++pgm_it;
+  //   }
 
-    auto lipp_it = lipp_.lower_bound(lower_key);
-    while(lipp_it != lipp_.end() && lipp_it->comp.data.key <= upper_key){
-      result += lipp_it->comp.data.value;
-      ++lipp_it;
-    }
+  //   auto lipp_it = lipp_.lower_bound(lower_key);
+  //   while(lipp_it != lipp_.end() && lipp_it->comp.data.key <= upper_key){
+  //     result += lipp_it->comp.data.value;
+  //     ++lipp_it;
+  //   }
 
-    return result;
+  //   return result;
+  // }
+
+  uint64_t RangeQuery(const KeyType& lower_key,
+                    const KeyType& upper_key,
+                    uint32_t thread_id) const {
+
+      uint64_t result = 0;
+
+      // 1. Active buffer
+      auto it = pgm_active_.lower_bound(lower_key);
+      while (it != pgm_active_.end() && it->key() <= upper_key) {
+          result += it->value();
+          ++it;
+      }
+
+      // 2. Flush buffer
+      it = pgm_flush_.lower_bound(lower_key);
+      while (it != pgm_flush_.end() && it->key() <= upper_key) {
+          result += it->value();
+          ++it;
+      }
+
+      // 3. LIPP
+      auto lipp_it = lipp_.lower_bound(lower_key);
+      while (lipp_it != lipp_.end() && lipp_it->comp.data.key <= upper_key) {
+          result += lipp_it->comp.data.value;
+          ++lipp_it;
+      }
+
+      return result;
   }
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
 
 
-    pgm_.insert(data.key, data.value);
+    pgm_active_.insert(data.key, data.value);
     current_buffer_size_++;
+    insert_count_++;
     if (current_buffer_size_ >= flush_threshold_)
     {
-      auto res = FlushInsertToLIPP(data, thread_id);
+
+      // Swap active and flush buffers
+      std::swap(pgm_active_, pgm_flush_);
+      size_t flush_size = current_buffer_size_;
+      current_buffer_size_ = 0;
+
+      auto res = FlushInsertToLIPP(flush_size, thread_id);
 
       if (!res){
         std::cerr << "Critical: Flush to LIPP failed!" << std::endl;
@@ -110,7 +177,7 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
     std::cout << "[HybridPGMLIPP] Initialized\n";
     return "HybridPGMLIPP";  }
 
-  std::size_t size() const { return pgm_.size_in_bytes() + lipp_.index_size(); }
+  std::size_t size() const { return pgm_active_.size_in_bytes() + pgm_flush_.size_in_bytes() + lipp_.index_size(); }
 
   bool applicable(bool unique, bool range_query, bool insert, bool multithread, const std::string& ops_filename) const {
     std::string name = SearchClass::name();
@@ -127,23 +194,29 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
  private:
 
   //Data storage engines
-  DynamicPGMIndex<KeyType, uint64_t, SearchClass, PGMIndex<KeyType, SearchClass, pgm_error, 16>> pgm_;
+  // DynamicPGMIndex<KeyType, uint64_t, SearchClass, PGMIndex<KeyType, SearchClass, pgm_error, 16>> pgm_;
   LIPP<KeyType, uint64_t> lipp_;
+
+  DynamicPGMIndex<KeyType, uint64_t, SearchClass, PGMIndex<KeyType, SearchClass, pgm_error, 16>> pgm_active_;
+  DynamicPGMIndex<KeyType, uint64_t, SearchClass, PGMIndex<KeyType, SearchClass, pgm_error, 16>> pgm_flush_;
 
   // Control Logic
   //@todo, in the future, can pass this value from params[0] in the cosnt
   size_t flush_threshold_ = 500000;
   size_t current_buffer_size_ = 0;
 
+  size_t insert_count_ = 0;
+  size_t lookup_count_ = 0;
+
   bool is_built_ = false;
 
-  bool FlushInsertToLIPP(const KeyValue<KeyType>& data, uint32_t thread_id) {
+  bool FlushInsertToLIPP(const size_t flush_size, uint32_t thread_id) {
 
     std::vector<std::pair<KeyType, uint64_t>> buffer;
-    buffer.reserve(current_buffer_size_);
+    buffer.reserve(flush_size);
 
-    for (auto it = pgm_.lower_bound(std::numeric_limits<KeyType>::min());
-         it != pgm_.end(); ++it) {
+    for (auto it = pgm_flush_.lower_bound(std::numeric_limits<KeyType>::min());
+         it != pgm_flush_.end(); ++it) {
         buffer.emplace_back(it->key(), it->value());
     }
 
@@ -154,10 +227,9 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
     }
     // 2. Reset the PGM index 
     // This calls the default constructor and replaces the old object
-    pgm_ = decltype(pgm_)(); 
+    pgm_flush_ = decltype(pgm_flush_)();
 
     // 3. Reset your tracking counter
-    current_buffer_size_ = 0;
     std::cout << "[HybridPGMLIPP] Flush size=" << buffer.size() << "\n";
     return true;
   }

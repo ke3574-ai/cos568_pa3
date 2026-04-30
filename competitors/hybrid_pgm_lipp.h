@@ -6,6 +6,9 @@
 #include <iostream>
 #include <vector>
 #include <limits>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 #include "../util.h"
 #include "base.h"
@@ -25,28 +28,38 @@ template <class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
  public:
   HybridPGMLIPP(const std::vector<int>& params){}
+
+  ~HybridPGMLIPP() {
+    if (flush_thread_.joinable()) {
+        flush_thread_.join();
+    }
+  }
+
   uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
 
-    if (is_built_) {
-        std::cout << "[HybridPGMLIPP] WARNING: Build() invoked more than once\n";
-    }
+      if (is_built_) {
+          std::cout << "[HybridPGMLIPP] WARNING: Build() invoked more than once\n";
+      }
 
-    is_built_ = true;
-    // TODO: use num_threads for parallel loading or preprocessing
-    std::cout << "[HybridPGMLIPP] Build started with " << data.size() << " elements\n";
-    std::vector<std::pair<KeyType, uint64_t>> loading_data;
+      is_built_ = true;
 
-    loading_data.reserve(data.size());
-    for (const auto& itm : data) {
-        loading_data.emplace_back(itm.key, itm.value);
-    }
+      // std::cout << "[HybridPGMLIPP] Build started with "
+      //           << data.size() << " elements\n";
 
-    uint64_t build_time = util::timing(
-      [&] { lipp_.bulk_load(loading_data.data(), loading_data.size()); });
-    
-    std::cout << "[HybridPGMLIPP] Build finished in " << build_time << " ns\n";
+      std::vector<std::pair<KeyType, uint64_t>> loading_data;
+      loading_data.reserve(data.size());
 
-    return build_time;
+      for (const auto& itm : data) {
+          loading_data.emplace_back(itm.key, itm.value);
+      }
+
+      uint64_t build_time = util::timing(
+          [&] { lipp_.bulk_load(loading_data.data(), loading_data.size()); });
+
+    //   std::cout << "[HybridPGMLIPP] Build finished in "
+    //             << build_time << " ns\n";
+
+      return build_time;
   }
 
   // size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
@@ -75,25 +88,32 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
 
       uint64_t value;
+        total_lookups_++;
+        window_lookups_++;
+      // 1. LIPP (fast path)
+      {
+          std::lock_guard<std::mutex> lock(lipp_mutex_);
+          if (lipp_.find(lookup_key, value)) {
+              lookup_count_++;
+              return value;
+          }
+      }
 
-      // 1. Check active buffer (newest)
+      // 2. Active buffer
       auto it = pgm_active_.find(lookup_key);
       if (it != pgm_active_.end()) {
           lookup_count_++;
           return it->value();
       }
 
-      // 2. Check flush buffer (recent, in-flight)
-      it = pgm_flush_.find(lookup_key);
-      if (it != pgm_flush_.end()) {
-          lookup_count_++;
-          return it->value();
-      }
-
-      // 3. Check LIPP (base)
-      if (lipp_.find(lookup_key, value)) {
-          lookup_count_++;
-          return value;
+      // 3. Flush buffer
+      if (flush_in_progress_.load(std::memory_order_acquire)) {
+          std::lock_guard<std::mutex> lock(flush_mutex_);
+          auto it2 = pgm_flush_.find(lookup_key);
+          if (it2 != pgm_flush_.end()) {
+              lookup_count_++;
+              return it2->value();
+          }
       }
 
       lookup_count_++;
@@ -123,7 +143,8 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
                     uint32_t thread_id) const {
 
       uint64_t result = 0;
-
+      total_lookups_++;
+      window_lookups_++;
       // 1. Active buffer
       auto it = pgm_active_.lower_bound(lower_key);
       while (it != pgm_active_.end() && it->key() <= upper_key) {
@@ -132,17 +153,25 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
       }
 
       // 2. Flush buffer
-      it = pgm_flush_.lower_bound(lower_key);
-      while (it != pgm_flush_.end() && it->key() <= upper_key) {
-          result += it->value();
-          ++it;
+      if (flush_in_progress_.load(std::memory_order_acquire)) {
+          std::lock_guard<std::mutex> lock(flush_mutex_);
+
+          auto it2 = pgm_flush_.lower_bound(lower_key);
+          while (it2 != pgm_flush_.end() && it2->key() <= upper_key) {
+              result += it2->value();
+              ++it2;
+          }
       }
 
       // 3. LIPP
-      auto lipp_it = lipp_.lower_bound(lower_key);
-      while (lipp_it != lipp_.end() && lipp_it->comp.data.key <= upper_key) {
-          result += lipp_it->comp.data.value;
-          ++lipp_it;
+      {
+          std::lock_guard<std::mutex> lock(lipp_mutex_);
+
+          auto lipp_it = lipp_.lower_bound(lower_key);
+          while (lipp_it != lipp_.end() && lipp_it->comp.data.key <= upper_key) {
+              result += lipp_it->comp.data.value;
+              ++lipp_it;
+          }
       }
 
       return result;
@@ -150,27 +179,36 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
 
+      pgm_active_.insert(data.key, data.value);
+      current_buffer_size_++;
+      insert_count_++;
+      total_inserts_++;
+      window_inserts_++;
 
-    pgm_active_.insert(data.key, data.value);
-    current_buffer_size_++;
-    insert_count_++;
-    if (current_buffer_size_ >= flush_threshold_)
-    {
+      if (current_buffer_size_ >= flush_threshold_) {
 
-      // Swap active and flush buffers
-      std::swap(pgm_active_, pgm_flush_);
-      size_t flush_size = current_buffer_size_;
-      current_buffer_size_ = 0;
+          // Wait for previous flush (minimal version)
+          if (flush_thread_.joinable()) {
+              flush_thread_.join();
+          }
 
-      auto res = FlushInsertToLIPP(flush_size, thread_id);
+          size_t flush_size = current_buffer_size_;
+          current_buffer_size_ = 0;
 
-      if (!res){
-        std::cerr << "Critical: Flush to LIPP failed!" << std::endl;
+          {
+              std::lock_guard<std::mutex> lock(flush_mutex_);
+              std::swap(pgm_active_, pgm_flush_);
+          }
+
+          flush_in_progress_.store(true, std::memory_order_release);
+
+          flush_thread_ = std::thread(
+              &HybridPGMLIPP::FlushInsertToLIPP,
+              this,
+              flush_size,
+              thread_id
+          );
       }
-    }
-    
-    // std::cout << "[HybridPGMLIPP] Insert Finished!\n";
-
   }
 
   std::string name() const { 
@@ -196,6 +234,7 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   //Data storage engines
   // DynamicPGMIndex<KeyType, uint64_t, SearchClass, PGMIndex<KeyType, SearchClass, pgm_error, 16>> pgm_;
   LIPP<KeyType, uint64_t> lipp_;
+  // std::vector<std::pair<KeyType, uint64_t>> base_data_;
 
   DynamicPGMIndex<KeyType, uint64_t, SearchClass, PGMIndex<KeyType, SearchClass, pgm_error, 16>> pgm_active_;
   DynamicPGMIndex<KeyType, uint64_t, SearchClass, PGMIndex<KeyType, SearchClass, pgm_error, 16>> pgm_flush_;
@@ -205,33 +244,64 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   size_t flush_threshold_ = 500000;
   size_t current_buffer_size_ = 0;
 
-  size_t insert_count_ = 0;
-  size_t lookup_count_ = 0;
+  mutable size_t insert_count_ = 0;
+  mutable size_t lookup_count_ = 0;
+
+  std::atomic<size_t> total_inserts_{0};
+  std::atomic<size_t> total_lookups_{0};
+  std::atomic<size_t> window_inserts_{0};
+  std::atomic<size_t> window_lookups_{0};
+
+  std::thread flush_thread_;
+  std::atomic<bool> flush_in_progress_{false};
+
+  mutable std::mutex flush_mutex_;  // protects pgm_flush_
+  mutable std::mutex lipp_mutex_;   // protects lipp_
 
   bool is_built_ = false;
 
   bool FlushInsertToLIPP(const size_t flush_size, uint32_t thread_id) {
 
-    std::vector<std::pair<KeyType, uint64_t>> buffer;
-    buffer.reserve(flush_size);
+      std::vector<std::pair<KeyType, uint64_t>> buffer;
+      buffer.reserve(flush_size);
 
-    for (auto it = pgm_flush_.lower_bound(std::numeric_limits<KeyType>::min());
-         it != pgm_flush_.end(); ++it) {
-        buffer.emplace_back(it->key(), it->value());
-    }
+      {
+          std::lock_guard<std::mutex> lock(flush_mutex_);
 
-    std::sort(buffer.begin(), buffer.end());
+          for (auto it = pgm_flush_.lower_bound(std::numeric_limits<KeyType>::min());
+              it != pgm_flush_.end(); ++it) {
+              buffer.emplace_back(it->key(), it->value());
+          }
+      }
 
-    for (const auto& [key, value] : buffer) {
-        lipp_.insert(key, value);
-    }
-    // 2. Reset the PGM index 
-    // This calls the default constructor and replaces the old object
-    pgm_flush_ = decltype(pgm_flush_)();
+      std::sort(buffer.begin(), buffer.end());
 
-    // 3. Reset your tracking counter
-    std::cout << "[HybridPGMLIPP] Flush size=" << buffer.size() << "\n";
-    return true;
+      {
+          std::lock_guard<std::mutex> lock(lipp_mutex_);
+
+          for (const auto& [key, value] : buffer) {
+              lipp_.insert(key, value);
+          }
+      }
+
+      {
+          std::lock_guard<std::mutex> lock(flush_mutex_);
+          pgm_flush_ = decltype(pgm_flush_)();
+      }
+
+        size_t ins = window_inserts_.exchange(0);
+        size_t lkp = window_lookups_.exchange(0);
+
+        double ratio = (double)lkp / (ins + lkp + 1);
+
+        std::cout << "[HybridPGMLIPP] Window Stats: "
+                << "Inserts=" << ins
+                << " Lookups=" << lkp
+                << " LookupRatio=" << ratio
+                << "\n";
+
+      flush_in_progress_.store(false, std::memory_order_release);
+      return true;
   }
 };
 

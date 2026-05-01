@@ -85,40 +85,164 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   //   return value;
   // }
 
-  size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+  void PrintWindowStats() const {
+      size_t ins = window_inserts_.exchange(0);
+      size_t lkp = window_lookups_.exchange(0);
 
-      uint64_t value;
-        total_lookups_++;
-        window_lookups_++;
-      // 1. LIPP (fast path)
-      {
-          std::lock_guard<std::mutex> lock(lipp_mutex_);
-          if (lipp_.find(lookup_key, value)) {
-              lookup_count_++;
-              return value;
-          }
-      }
+      double ratio = (double)lkp / (ins + lkp + 1);
 
-      // 2. Active buffer
-      auto it = pgm_active_.find(lookup_key);
-      if (it != pgm_active_.end()) {
-          lookup_count_++;
-          return it->value();
-      }
+        if (ratio > 0.7) {
+            mode_.store(Mode::LOOKUP_HEAVY, std::memory_order_relaxed);
+        } else {
+            mode_.store(Mode::INSERT_HEAVY, std::memory_order_relaxed);
+        }
 
-      // 3. Flush buffer
-      if (flush_in_progress_.load(std::memory_order_acquire)) {
-          std::lock_guard<std::mutex> lock(flush_mutex_);
-          auto it2 = pgm_flush_.find(lookup_key);
-          if (it2 != pgm_flush_.end()) {
-              lookup_count_++;
-              return it2->value();
-          }
-      }
-
-      lookup_count_++;
-      return util::OVERFLOW;
+      std::cout << "[HybridPGMLIPP] Window Stats: "
+                << "Inserts=" << ins
+                << " Lookups=" << lkp
+                << " LookupRatio=" << ratio
+                << "\n";
   }
+
+    void MaybeSetModeOnce() const {
+        if (mode_decided_.load(std::memory_order_relaxed)) return;
+
+        size_t ins = total_inserts_.load(std::memory_order_relaxed);
+        size_t lkp = total_lookups_.load(std::memory_order_relaxed);
+        size_t total = ins + lkp;
+
+        if (total < LEARN_THRESHOLD) return;
+
+        double ratio = (double)lkp / (total + 1);
+
+        if (ratio > 0.7) {
+        mode_.store(Mode::LOOKUP_HEAVY, std::memory_order_relaxed);
+        } else {
+        mode_.store(Mode::INSERT_HEAVY, std::memory_order_relaxed);
+        }
+
+        mode_decided_.store(true, std::memory_order_relaxed);
+    }
+
+    size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+
+    uint64_t value;
+
+    total_lookups_.fetch_add(1, std::memory_order_relaxed);
+    if (!mode_decided_.load(std::memory_order_relaxed)) {
+        MaybeSetModeOnce();
+    }
+
+    Mode m = mode_.load(std::memory_order_relaxed);
+
+    // 🔴 LOOKUP_HEAVY → LIPP first
+    if (m == Mode::LOOKUP_HEAVY) {
+        {
+            std::lock_guard<std::mutex> lock(lipp_mutex_);
+            if (lipp_.find(lookup_key, value)) {
+                return value;
+            }
+        }
+
+        auto it = pgm_active_.find(lookup_key);
+        if (it != pgm_active_.end()) {
+            return it->value();
+        }
+
+        return util::OVERFLOW;
+    }
+
+    // 🔵 INSERT_HEAVY → PGM first
+    if (m == Mode::INSERT_HEAVY) {
+        auto it = pgm_active_.find(lookup_key);
+        if (it != pgm_active_.end()) {
+            return it->value();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(lipp_mutex_);
+            if (lipp_.find(lookup_key, value)) {
+                return value;
+            }
+        }
+
+        return util::OVERFLOW;
+    }
+
+    // 🟡 LEARNING → LIPP first (your design choice)
+    {
+        std::lock_guard<std::mutex> lock(lipp_mutex_);
+        if (lipp_.find(lookup_key, value)) {
+            return value;
+        }
+    }
+
+    auto it = pgm_active_.find(lookup_key);
+    if (it != pgm_active_.end()) {
+        return it->value();
+    }
+
+    return util::OVERFLOW;
+}
+  
+    // size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+
+    //     uint64_t value;
+
+    //     total_lookups_.fetch_add(1, std::memory_order_relaxed);
+    //     window_lookups_.fetch_add(1, std::memory_order_relaxed);
+
+    //     size_t window = window_inserts_.load() + window_lookups_.load();
+
+    //     if (window >= 500000 &&
+    //         !stats_in_progress_.exchange(true, std::memory_order_acquire)) {
+
+    //         PrintWindowStats();
+
+    //         stats_in_progress_.store(false, std::memory_order_release);
+    //     }
+
+    //     Mode m = mode_.load(std::memory_order_relaxed);
+
+    //     // 🔴 LOOKUP_HEAVY → LIPP first
+    //     if (m == Mode::LOOKUP_HEAVY) {
+    //         {
+    //             std::lock_guard<std::mutex> lock(lipp_mutex_);
+    //             if (lipp_.find(lookup_key, value)) {
+    //                 lookup_count_++;
+    //                 return value;
+    //             }
+    //         }
+    //     }
+
+    //     // 🔵 Always check PGM (fallback or primary)
+    //     auto it = pgm_active_.find(lookup_key);
+    //     if (it != pgm_active_.end()) {
+    //         lookup_count_++;
+    //         return it->value();
+    //     }
+
+    //     if (flush_in_progress_.load(std::memory_order_acquire)) {
+    //         std::lock_guard<std::mutex> lock(flush_mutex_);
+    //         auto it2 = pgm_flush_.find(lookup_key);
+    //         if (it2 != pgm_flush_.end()) {
+    //             lookup_count_++;
+    //             return it2->value();
+    //         }
+    //     }
+
+    //     // 🔵 INSERT_HEAVY → LIPP fallback
+    //     if (m == Mode::INSERT_HEAVY) {
+    //         std::lock_guard<std::mutex> lock(lipp_mutex_);
+    //         if (lipp_.find(lookup_key, value)) {
+    //             lookup_count_++;
+    //             return value;
+    //         }
+    //     }
+
+    //     lookup_count_++;
+    //     return util::OVERFLOW;
+    // }
 
   // uint64_t RangeQuery(const KeyType& lower_key, const KeyType& upper_key, uint32_t thread_id) const {
 
@@ -142,77 +266,135 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
                     const KeyType& upper_key,
                     uint32_t thread_id) const {
 
-      uint64_t result = 0;
-      total_lookups_++;
-      window_lookups_++;
-      // 1. Active buffer
-      auto it = pgm_active_.lower_bound(lower_key);
-      while (it != pgm_active_.end() && it->key() <= upper_key) {
-          result += it->value();
-          ++it;
-      }
+        uint64_t result = 0;
 
-      // 2. Flush buffer
-      if (flush_in_progress_.load(std::memory_order_acquire)) {
-          std::lock_guard<std::mutex> lock(flush_mutex_);
+        total_lookups_.fetch_add(1, std::memory_order_relaxed);
+        window_lookups_.fetch_add(1, std::memory_order_relaxed);
 
-          auto it2 = pgm_flush_.lower_bound(lower_key);
-          while (it2 != pgm_flush_.end() && it2->key() <= upper_key) {
-              result += it2->value();
-              ++it2;
-          }
-      }
+        Mode m = mode_.load(std::memory_order_relaxed);
 
-      // 3. LIPP
-      {
-          std::lock_guard<std::mutex> lock(lipp_mutex_);
+        // 🔴 LOOKUP_HEAVY → LIPP first
+        if (m == Mode::LOOKUP_HEAVY) {
+            {
+                std::lock_guard<std::mutex> lock(lipp_mutex_);
+                auto it = lipp_.lower_bound(lower_key);
+                while (it != lipp_.end() && it->comp.data.key <= upper_key) {
+                    result += it->comp.data.value;
+                    ++it;
+                }
+            }
+        }
 
-          auto lipp_it = lipp_.lower_bound(lower_key);
-          while (lipp_it != lipp_.end() && lipp_it->comp.data.key <= upper_key) {
-              result += lipp_it->comp.data.value;
-              ++lipp_it;
-          }
-      }
+        // 🔵 Always scan PGM (fallback or primary)
+        auto it = pgm_active_.lower_bound(lower_key);
+        while (it != pgm_active_.end() && it->key() <= upper_key) {
+            result += it->value();
+            ++it;
+        }
 
-      return result;
-  }
+        if (flush_in_progress_.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(flush_mutex_);
+            auto it2 = pgm_flush_.lower_bound(lower_key);
+            while (it2 != pgm_flush_.end() && it2->key() <= upper_key) {
+                result += it2->value();
+                ++it2;
+            }
+        }
 
-  void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
+        // 🔵 INSERT_HEAVY → LIPP fallback
+        if (m == Mode::INSERT_HEAVY) {
+            std::lock_guard<std::mutex> lock(lipp_mutex_);
+            auto it = lipp_.lower_bound(lower_key);
+            while (it != lipp_.end() && it->comp.data.key <= upper_key) {
+                result += it->comp.data.value;
+                ++it;
+            }
+        }
 
-      pgm_active_.insert(data.key, data.value);
-      current_buffer_size_++;
-      insert_count_++;
-      total_inserts_++;
-      window_inserts_++;
+        return result;
+    }
 
-      if (current_buffer_size_ >= flush_threshold_) {
+//   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
 
-          // Wait for previous flush (minimal version)
-          if (flush_thread_.joinable()) {
-              flush_thread_.join();
-          }
+//       pgm_active_.insert(data.key, data.value);
+//       current_buffer_size_++;
+//       // insert_count_++;
+//       total_inserts_.fetch_add(1, std::memory_order_relaxed);
+//       window_inserts_.fetch_add(1, std::memory_order_relaxed);
+      
+//       size_t window = window_inserts_.load() + window_lookups_.load();
 
-          size_t flush_size = current_buffer_size_;
-          current_buffer_size_ = 0;
+//         if (window >= 500000 &&
+//             !stats_in_progress_.exchange(true, std::memory_order_acquire)) {
 
-          {
-              std::lock_guard<std::mutex> lock(flush_mutex_);
-              std::swap(pgm_active_, pgm_flush_);
-          }
+//             PrintWindowStats();
 
-          flush_in_progress_.store(true, std::memory_order_release);
+//             stats_in_progress_.store(false, std::memory_order_release);
+//         }
 
-          flush_thread_ = std::thread(
-              &HybridPGMLIPP::FlushInsertToLIPP,
-              this,
-              flush_size,
-              thread_id
-          );
-      }
-  }
+//       Mode m = mode_.load(std::memory_order_relaxed);
+
+//         if (m == Mode::LOOKUP_HEAVY) {
+//             flush_threshold_ = 50'000;
+//         } else {
+//             flush_threshold_ = 1'000'000;
+//         }
+
+//       if (current_buffer_size_ >= flush_threshold_) {
+
+//           // Wait for previous flush (minimal version)
+//           if (flush_thread_.joinable()) {
+//               flush_thread_.join();
+//           }
+
+//           size_t flush_size = current_buffer_size_;
+//           current_buffer_size_ = 0;
+
+//           {
+//               std::lock_guard<std::mutex> lock(flush_mutex_);
+//               std::swap(pgm_active_, pgm_flush_);
+//           }
+
+//           flush_in_progress_.store(true, std::memory_order_release);
+
+//           flush_thread_ = std::thread(
+//               &HybridPGMLIPP::FlushInsertToLIPP,
+//               this,
+//               flush_size,
+//               thread_id
+//           );
+//       }
+//   }
+
+void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
+
+    total_inserts_.fetch_add(1, std::memory_order_relaxed);
+    if (!mode_decided_.load(std::memory_order_relaxed)) {
+        MaybeSetModeOnce();
+    }
+    // MaybeUpdateMode();
+
+    Mode m = mode_.load(std::memory_order_relaxed);
+
+    // 🔴 PURE LIPP
+    if (m == Mode::LOOKUP_HEAVY) {
+        std::lock_guard<std::mutex> lock(lipp_mutex_);
+        lipp_.insert(data.key, data.value);
+        return;
+    }
+
+    // 🔵 PURE PGM
+    if (m == Mode::INSERT_HEAVY) {
+        pgm_active_.insert(data.key, data.value);
+        return;
+    }
+
+    // 🟡 LEARNING phase → behave like PGM (safe + fast)
+    pgm_active_.insert(data.key, data.value);
+}
 
   std::string name() const { 
-    std::cout << "[HybridPGMLIPP] Initialized\n";
+    // std::cout << "[HybridPGMLIPP] Initialized\n";
     return "HybridPGMLIPP";  }
 
   std::size_t size() const { return pgm_active_.size_in_bytes() + pgm_flush_.size_in_bytes() + lipp_.index_size(); }
@@ -241,16 +423,20 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
   // Control Logic
   //@todo, in the future, can pass this value from params[0] in the cosnt
-  size_t flush_threshold_ = 500000;
+  size_t flush_threshold_ = 50'000;
   size_t current_buffer_size_ = 0;
 
   mutable size_t insert_count_ = 0;
   mutable size_t lookup_count_ = 0;
 
-  std::atomic<size_t> total_inserts_{0};
-  std::atomic<size_t> total_lookups_{0};
-  std::atomic<size_t> window_inserts_{0};
-  std::atomic<size_t> window_lookups_{0};
+  mutable std::atomic<size_t> total_inserts_{0};
+  mutable std::atomic<size_t> total_lookups_{0};
+  mutable std::atomic<size_t> window_inserts_{0};
+  mutable std::atomic<size_t> window_lookups_{0};
+  mutable std::atomic<bool> stats_in_progress_{false};
+
+  mutable std::atomic<bool> mode_decided_{false};
+    static constexpr size_t LEARN_THRESHOLD = 50'000;
 
   std::thread flush_thread_;
   std::atomic<bool> flush_in_progress_{false};
@@ -259,6 +445,13 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   mutable std::mutex lipp_mutex_;   // protects lipp_
 
   bool is_built_ = false;
+
+  enum class Mode {
+        INSERT_HEAVY,
+        LOOKUP_HEAVY
+    };
+
+    mutable std::atomic<Mode> mode_{Mode::INSERT_HEAVY};
 
   bool FlushInsertToLIPP(const size_t flush_size, uint32_t thread_id) {
 
@@ -289,16 +482,11 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
           pgm_flush_ = decltype(pgm_flush_)();
       }
 
-        size_t ins = window_inserts_.exchange(0);
-        size_t lkp = window_lookups_.exchange(0);
-
-        double ratio = (double)lkp / (ins + lkp + 1);
-
-        std::cout << "[HybridPGMLIPP] Window Stats: "
-                << "Inserts=" << ins
-                << " Lookups=" << lkp
-                << " LookupRatio=" << ratio
-                << "\n";
+        // std::cout << "[HybridPGMLIPP] Window Stats: "
+        //         << "Inserts=" << ins
+        //         << " Lookups=" << lkp
+        //         << " LookupRatio=" << ratio
+        //         << "\n";
 
       flush_in_progress_.store(false, std::memory_order_release);
       return true;

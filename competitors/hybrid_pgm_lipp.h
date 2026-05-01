@@ -33,6 +33,7 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
     if (flush_thread_.joinable()) {
         flush_thread_.join();
     }
+    PrintHitStats();
   }
 
   uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
@@ -124,65 +125,60 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
         mode_decided_.store(true, std::memory_order_relaxed);
     }
 
+
+    void PrintHitStats() const {
+        size_t l = lipp_hits_.load();
+        size_t p = pgm_hits_.load();
+        size_t m = misses_.load();
+        size_t total = l + p + m;
+
+        std::cout << "[HitStats] LIPP=" << l
+                  << " PGM=" << p
+                  << " MISS=" << m
+                  << " LIPP_ratio=" << (double)l / (total + 1)
+                  << " PGM_ratio=" << (double)p / (total + 1)
+                  << "\n";
+    }
+    
     size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+        uint64_t value;
 
-    uint64_t value;
-
-    total_lookups_.fetch_add(1, std::memory_order_relaxed);
-    if (!mode_decided_.load(std::memory_order_relaxed)) {
-        MaybeSetModeOnce();
-    }
-
-    Mode m = mode_.load(std::memory_order_relaxed);
-
-    // 🔴 LOOKUP_HEAVY → LIPP first
-    if (m == Mode::LOOKUP_HEAVY) {
-        {
-            std::lock_guard<std::mutex> lock(lipp_mutex_);
-            if (lipp_.find(lookup_key, value)) {
-                return value;
-            }
+        // FAST PATH: after lookup-heavy mode is fully materialized,
+        // behave like pure LIPP.
+        if (mode_.load(std::memory_order_relaxed) == Mode::LOOKUP_HEAVY &&
+            materialized_.load(std::memory_order_acquire)) {
+            return lipp_.find(lookup_key, value) ? value : util::NOT_FOUND;
         }
+
+        // Learning / insert-heavy path.
+        total_lookups_.fetch_add(1, std::memory_order_relaxed);
+
+        if (!mode_decided_.load(std::memory_order_relaxed)) {
+            MaybeSetModeOnce();
+        }
+
+        Mode m = mode_.load(std::memory_order_relaxed);
+
+        if (m == Mode::LOOKUP_HEAVY) {
+            // Not materialized yet: safe fallback.
+            if (lipp_.find(lookup_key, value)) return value;
+
+            auto it = pgm_active_.find(lookup_key);
+            return (it == pgm_active_.end()) ? util::NOT_FOUND : it->value();
+        }
+
+        if (m == Mode::INSERT_HEAVY) {
+            auto it = pgm_active_.find(lookup_key);
+            if (it != pgm_active_.end()) return it->value();
+
+            return lipp_.find(lookup_key, value) ? value : util::NOT_FOUND;
+        }
+
+        // LEARNING: LIPP first, then PGM.
+        if (lipp_.find(lookup_key, value)) return value;
 
         auto it = pgm_active_.find(lookup_key);
-        if (it != pgm_active_.end()) {
-            return it->value();
-        }
-
-        return util::OVERFLOW;
-    }
-
-    // 🔵 INSERT_HEAVY → PGM first
-    if (m == Mode::INSERT_HEAVY) {
-        auto it = pgm_active_.find(lookup_key);
-        if (it != pgm_active_.end()) {
-            return it->value();
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(lipp_mutex_);
-            if (lipp_.find(lookup_key, value)) {
-                return value;
-            }
-        }
-
-        return util::OVERFLOW;
-    }
-
-    // 🟡 LEARNING → LIPP first (your design choice)
-    {
-        std::lock_guard<std::mutex> lock(lipp_mutex_);
-        if (lipp_.find(lookup_key, value)) {
-            return value;
-        }
-    }
-
-    auto it = pgm_active_.find(lookup_key);
-    if (it != pgm_active_.end()) {
-        return it->value();
-    }
-
-    return util::OVERFLOW;
+        return (it == pgm_active_.end()) ? util::NOT_FOUND : it->value();
 }
   
     // size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
@@ -366,31 +362,100 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 //       }
 //   }
 
+void MaybeDecideModeLight() const {
+    if (mode_decided_.load(std::memory_order_relaxed)) return;
+
+    size_t ins = total_inserts_.load(std::memory_order_relaxed);
+    size_t lkp = total_lookups_.load(std::memory_order_relaxed);
+    size_t total = ins + lkp;
+
+    if (total < LEARN_THRESHOLD) return;
+
+    double ratio = (double)lkp / (total + 1);
+
+    mode_.store(ratio > 0.7 ? Mode::LOOKUP_HEAVY : Mode::INSERT_HEAVY,
+                std::memory_order_relaxed);
+
+    mode_decided_.store(true, std::memory_order_relaxed);
+}
+
+void EnsureMaterialized(uint32_t thread_id) {
+    if (materialized_.exchange(true, std::memory_order_acq_rel)) return;
+
+    // Move all PGM data into LIPP
+    for (auto it = pgm_active_.lower_bound(std::numeric_limits<KeyType>::min());
+         it != pgm_active_.end(); ++it) {
+        lipp_.insert(it->key(), it->value());
+    }
+
+    // Clear PGM
+    pgm_active_ = decltype(pgm_active_)();
+}
+
+// void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
+
+//     total_inserts_.fetch_add(1, std::memory_order_relaxed);
+//     if (!mode_decided_.load(std::memory_order_relaxed)) {
+//         MaybeSetModeOnce();
+//     }
+//     // MaybeUpdateMode();
+
+//     Mode m = mode_.load(std::memory_order_relaxed);
+
+//     // 🔴 PURE LIPP
+//     if (m == Mode::LOOKUP_HEAVY) {
+//         // std::lock_guard<std::mutex> lock(lipp_mutex_);
+//         lipp_.insert(data.key, data.value);
+//         return;
+//     }
+
+//     // 🔵 PURE PGM
+//     if (m == Mode::INSERT_HEAVY) {
+//         pgm_active_.insert(data.key, data.value);
+//         return;
+//     }
+
+//     // 🟡 LEARNING phase → behave like PGM (safe + fast)
+//     pgm_active_.insert(data.key, data.value);
+// }
+
 void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
 
     total_inserts_.fetch_add(1, std::memory_order_relaxed);
+
     if (!mode_decided_.load(std::memory_order_relaxed)) {
         MaybeSetModeOnce();
     }
-    // MaybeUpdateMode();
 
     Mode m = mode_.load(std::memory_order_relaxed);
 
-    // 🔴 PURE LIPP
     if (m == Mode::LOOKUP_HEAVY) {
-        std::lock_guard<std::mutex> lock(lipp_mutex_);
+        if (!materialized_.load(std::memory_order_acquire)) {
+            EnsureMaterialized(thread_id);
+        }
+
         lipp_.insert(data.key, data.value);
         return;
     }
 
-    // 🔵 PURE PGM
     if (m == Mode::INSERT_HEAVY) {
         pgm_active_.insert(data.key, data.value);
         return;
     }
 
-    // 🟡 LEARNING phase → behave like PGM (safe + fast)
+    // LEARNING
     pgm_active_.insert(data.key, data.value);
+}
+
+void EnsureMaterialized(uint32_t thread_id) {
+    if (materialized_.exchange(true, std::memory_order_acq_rel)) return;
+
+    for (auto it = pgm_active_.lower_bound(std::numeric_limits<KeyType>::min());
+         it != pgm_active_.end(); ++it) {
+        lipp_.insert(it->key(), it->value());
+    }
+
+    pgm_active_ = decltype(pgm_active_)();
 }
 
   std::string name() const { 
@@ -435,8 +500,14 @@ void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
   mutable std::atomic<size_t> window_lookups_{0};
   mutable std::atomic<bool> stats_in_progress_{false};
 
+  mutable std::atomic<size_t> lipp_hits_{0};
+  mutable std::atomic<size_t> pgm_hits_{0};
+  mutable std::atomic<size_t> misses_{0};
+
   mutable std::atomic<bool> mode_decided_{false};
-    static constexpr size_t LEARN_THRESHOLD = 50'000;
+  static constexpr size_t LEARN_THRESHOLD = 50'000;
+
+  mutable std::atomic<bool> materialized_{false};
 
   std::thread flush_thread_;
   std::atomic<bool> flush_in_progress_{false};
@@ -447,11 +518,12 @@ void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
   bool is_built_ = false;
 
   enum class Mode {
-        INSERT_HEAVY,
-        LOOKUP_HEAVY
-    };
+    LEARNING,
+    INSERT_HEAVY,
+    LOOKUP_HEAVY
+  };
 
-    mutable std::atomic<Mode> mode_{Mode::INSERT_HEAVY};
+  mutable std::atomic<Mode> mode_{Mode::LEARNING};
 
   bool FlushInsertToLIPP(const size_t flush_size, uint32_t thread_id) {
 
